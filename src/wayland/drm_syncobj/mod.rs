@@ -121,7 +121,7 @@ impl Cacheable for DrmSyncobjCachedState {
 #[derive(Debug)]
 pub struct DrmSyncobjState {
     global: GlobalId,
-    import_device: DrmDeviceFd,
+    import_device: Option<DrmDeviceFd>,
     known_timelines: Vec<Weak<DrmTimelineInner>>,
 }
 
@@ -155,9 +155,17 @@ impl DrmSyncobjState {
 
         Self {
             global,
-            import_device,
+            import_device: Some(import_device),
             known_timelines: Vec::new(),
         }
+    }
+
+    /// Closes the current `import_device`, allowing compositors to acquire a new fd.
+    ///
+    /// Note: Any existing timeline objects will error out and hang clients,
+    /// until `update_device` is called with a new device fd.
+    pub fn close_device(&mut self) {
+        self.import_device.take();
     }
 
     /// Sets a new `import_device` to import the syncobj fds and wait on them.
@@ -170,7 +178,7 @@ impl DrmSyncobjState {
                 warn!(?err, "Failed to update existing timeline");
             }
         }
-        self.import_device = import_device;
+        self.import_device = Some(import_device);
     }
 
     /// Destroys the state and returns the `GlobalId` for compositors to disable/destroy.
@@ -327,15 +335,21 @@ where
             }
             wp_linux_drm_syncobj_manager_v1::Request::ImportTimeline { id, fd } => {
                 if let Some(state) = state.drm_syncobj_state() {
-                    match DrmTimeline::new(&state.import_device, fd) {
-                        Ok(timeline) => {
+                    match state.import_device.as_ref().map(|dev| DrmTimeline::new(dev, fd)) {
+                        Some(Ok(timeline)) => {
                             state.known_timelines.push(Arc::downgrade(&timeline.0));
                             data_init.init::<_, _>(id, DrmSyncobjTimelineData { timeline });
                         }
-                        Err(err) => {
+                        Some(Err(err)) => {
                             resource.post_error(
                                 wp_linux_drm_syncobj_manager_v1::Error::InvalidTimeline as u32,
                                 format!("failed to import syncobj timeline: {err}"),
+                            );
+                        }
+                        None => {
+                            resource.post_error(
+                                wp_linux_drm_syncobj_manager_v1::Error::InvalidTimeline as u32,
+                                format!("failed to import syncobj timeline: No device"),
                             );
                         }
                     }
